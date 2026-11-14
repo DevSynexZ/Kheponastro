@@ -1,14 +1,8 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import {
-  Crosshair,
-  Play,
-  Terminal,
-  Cpu,
-  AlertTriangle,
-  Zap,
-} from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Play } from "lucide-react";
 import CombatTransition from "@/components/CombatTransition";
 
 interface HealthStatus {
@@ -17,10 +11,30 @@ interface HealthStatus {
   solvers_ready: string[];
 }
 
+interface TrajectoryData {
+  trajectory: Array<{ t: number; x: number; y: number; vx: number; vy: number; v: number }>;
+  max_height: number;
+  range: number;
+  flight_time: number;
+  apex_time: number;
+  impact_velocity: number;
+  params: {
+    v0: number;
+    angle: number;
+    g: number;
+    drag_coeff: number;
+    mass: number;
+    dt: number;
+  };
+}
+
 export default function KheponastroHome() {
+  const router = useRouter();
   const [backend, setBackend] = useState<HealthStatus | null>(null);
   const [backendError, setBackendError] = useState<boolean>(false);
   const [isEntering, setIsEntering] = useState<boolean>(false);
+  const [trajectoryData, setTrajectoryData] = useState<TrajectoryData | null>(null);
+  const [trajectoryLoading, setTrajectoryLoading] = useState(false);
 
   useEffect(() => {
     fetch("/api/py/health")
@@ -32,13 +46,35 @@ export default function KheponastroHome() {
       .catch(() => setBackendError(true));
   }, []);
 
+  // Pre-fetch trajectory data for smoother transition
+  const preloadTrajectory = async () => {
+    setTrajectoryLoading(true);
+    try {
+      const res = await fetch("/api/py/simulate-trajectory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ v0: 50, angle: 45, drag_coeff: 0.02, mass: 1.0, dt: 0.01 }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTrajectoryData(data);
+      }
+    } catch (err) {
+      console.warn("Failed to preload trajectory:", err);
+    } finally {
+      setTrajectoryLoading(false);
+    }
+  };
+
   const handleEnterArena = () => {
     setIsEntering(true);
+    if (!trajectoryData && !trajectoryLoading) {
+      preloadTrajectory();
+    }
   };
 
   const handleLoadingComplete = () => {
-    // Redirect or switch view to your combat arena page/route
-    window.location.href = "/arena";
+    router.push("/arena");
   };
 
   return (
@@ -47,6 +83,7 @@ export default function KheponastroHome() {
       <CombatTransition
         isEntering={isEntering}
         onLoadingComplete={handleLoadingComplete}
+        trajectoryData={trajectoryData}
       />
 
       {/* Background War Image Layer */}
@@ -101,14 +138,37 @@ export default function KheponastroHome() {
         </div>
 
         {/* Action Buttons */}
-        <div className="pt-4 flex flex-wrap justify-center gap-4">
+        <div className="pt-4 flex flex-col sm:flex-row items-center justify-center gap-4">
           <button
             onClick={handleEnterArena}
-            className="inline-flex items-center gap-3 px-8 py-4 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-extrabold text-sm tracking-wider uppercase transition shadow-[0_0_25px_rgba(16,185,129,0.5)] cursor-pointer transform hover:-translate-y-0.5"
+            className="inline-flex items-center gap-3 px-8 py-4 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-extrabold text-sm tracking-wider uppercase transition shadow-[0_0_25px_rgba(16,185,129,0.5)] cursor-pointer transform hover:-translate-y-0.5 active:scale-95"
           >
             <Play className="w-5 h-5 fill-current" />
             ENTER COMBAT ARENA
           </button>
+
+          {/* Quick Start direct link */}
+          <a
+            href="/arena"
+            className="inline-flex items-center gap-2 px-6 py-4 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 font-mono text-xs border border-cyan-500/30 transition"
+          >
+            <span>⚡</span>
+            <span>INSTANT DEPLOY</span>
+          </a>
+
+          {/* Preload indicator */}
+          {trajectoryLoading && (
+            <div className="flex items-center gap-2 text-xs font-mono text-cyan-400/70">
+              <span className="w-4 h-4 border-2 border-cyan-400/30 border-t-cyan-400 rounded-full animate-spin" />
+              <span>PRELOADING BALLISTICS...</span>
+            </div>
+          )}
+          {trajectoryData && !trajectoryLoading && (
+            <div className="flex items-center gap-2 text-xs font-mono text-emerald-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span>TRAJECTORY READY</span>
+            </div>
+          )}
         </div>
       </section>
 
