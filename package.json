@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "fastapi-dev": "python -m uvicorn api.index:app --reload --port 8000",
+    "fastapi-dev": "./venv/bin/python -m uvicorn api.index:app --reload --port 8000",
     "next-dev": "next dev",
     "dev": "concurrently -k -n \"NEXT,FASTAPI\" -c \"cyan,yellow\" \"npm run next-dev\" \"npm run fastapi-dev\"",
     "build": "next build",
@@ -12,11 +12,13 @@
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.3.5",
+    "@types/three": "^0.187.0",
     "framer-motion": "^14.14.0",
     "lucide-react": "^1.72.0",
     "next": "16.4.6",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "three": "^0.187.0",
     "touch": "^3.1.1"
   },
   "devDependencies": {
