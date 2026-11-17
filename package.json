@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "fastapi-dev": "./venv/bin/python -m uvicorn api.index:app --reload --port 8000",
+    "fastapi-dev": "python -m uvicorn api.index:app --reload --port 8000",
     "next-dev": "next dev",
     "dev": "concurrently -k -n \"NEXT,FASTAPI\" -c \"cyan,yellow\" \"npm run next-dev\" \"npm run fastapi-dev\"",
     "build": "next build",

@@ -521,7 +521,7 @@ export function fireOrdnance(
     if (impact.hitTarget && t.id === impact.hitTarget.id) {
       const newHealth = Math.max(0, t.health - impact.damageDealt);
       return { ...t, health: newHealth, destroyed: newHealth <= 0, hit: true };
-    }
+    } 
     const splash = impact.splashDamage.find((s) => s.target.id === t.id);
     if (splash) {
       const newHealth = Math.max(0, t.health - splash.damage);
