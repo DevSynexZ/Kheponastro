@@ -229,7 +229,7 @@ export default function GameHUD({
             <div className="bg-slate-950/95 border-2 border-red-500/50 rounded-3xl p-8 max-w-md w-full mx-4 text-center shadow-[0_0_60px_rgba(239,68,68,0.35)]">
               <div className="text-4xl mb-2">💥</div>
               <h2 className="font-tactical text-3xl font-extrabold text-red-500 tracking-wider mb-1">
-                TANK DESTROYED
+                AIRCRAFT DESTROYED
               </h2>
               <p className="font-mono text-xs text-slate-400 mb-6">
                 YOU SURVIVED UNTIL WAVE {hud.wave}

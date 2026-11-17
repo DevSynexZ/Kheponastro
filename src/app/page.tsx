@@ -70,10 +70,7 @@ export default function KheponastroHome() {
   };
 
   const handleEnterArena = () => {
-    setIsEntering(true);
-    if (!trajectoryData && !trajectoryLoading) {
-      preloadTrajectory();
-    }
+    router.push("/arena");
   };
 
   const handleLoadingComplete = () => {

@@ -87,6 +87,9 @@ export interface Projectile {
   isRocket?: boolean;
   life: number;
   maxLife: number;
+  // Numerical methods integration
+  trajectory?: import("./numericalMethods").RK4SystemResult;
+  trajectoryIndex?: number;
 }
 
 export type PickupType = "health" | "shield" | "dual" | "rapid" | "shotgun" | "rocket";
@@ -120,6 +123,20 @@ export interface FloatingText {
   color: string;
   life: number;
   vy: number;
+}
+
+export interface AnimatedExplosion {
+  id: string;
+  x: number;
+  y: number;
+  series: 1 | 2 | 3;
+  frame: number;
+  maxFrames: number;
+  scale: number;
+  fps: number;
+  timeAcc: number;
+  rotation: number;
+  done: boolean;
 }
 
 export interface GameHUDState {

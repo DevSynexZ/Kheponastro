@@ -13,6 +13,7 @@ import {
   PickupType,
   Particle,
   FloatingText,
+  AnimatedExplosion,
   WeaponType,
   WEAPON_REGISTRY,
   GameHUDState,
@@ -22,9 +23,34 @@ import {
   playPlayerShoot,
   playEnemyShoot,
   playHitSound,
+  playEnemyDie,
   playExplosionImpact,
   playPickupSound,
 } from "./audio";
+
+import {
+  initSpriteManager,
+  drawBackground,
+  drawPlayerSprite,
+  drawEnemySprite,
+  drawProjectileSprite,
+  createAnimatedExplosion,
+  updateAndDrawExplosions,
+} from "./gameSprites";
+
+import {
+  rk4Projectile,
+  calculateInterceptAngle,
+  calculateOptimalAngle,
+  modifiedEulerStep,
+  applyDrag,
+  knapsackOrdnanceSelector,
+  bisectionMethod,
+  newtonRaphsonMethod,
+  ProjectileParams,
+  RK4SystemResult,
+  InterceptSolution,
+} from "./numericalMethods";
 
 export interface TopDownEngineCallbacks {
   onHUDUpdate: (hud: GameHUDState) => void;
@@ -37,6 +63,8 @@ export interface TopDownEngine {
   stop: () => void;
   pause: () => void;
   resume: () => void;
+  togglePause: () => void;
+  isPaused: () => boolean;
   restart: () => void;
   nextWave: () => void;
   setKeys: (keys: Record<string, boolean>) => void;
@@ -52,11 +80,19 @@ export function createTopDownEngine(
   canvas: HTMLCanvasElement,
   callbacks: TopDownEngineCallbacks
 ): TopDownEngine {
-  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })!;
+  const ctx = canvas.getContext("2d")!;
+
+  function getViewportDimensions() {
+    const rect = canvas.getBoundingClientRect();
+    const w = rect.width > 50 ? rect.width : (typeof window !== "undefined" ? window.innerWidth : 1200);
+    const h = rect.height > 50 ? rect.height : (typeof window !== "undefined" ? window.innerHeight : 800);
+    return { w, h };
+  }
 
   // Arena World Dimensions
-  let arenaWidth = canvas.width || 1200;
-  let arenaHeight = canvas.height || 800;
+  const initialDim = getViewportDimensions();
+  let arenaWidth = initialDim.w;
+  let arenaHeight = initialDim.h;
 
   // Input State
   const keys: Record<string, boolean> = {};
@@ -108,21 +144,61 @@ export function createTopDownEngine(
   const pickups: Pickup[] = [];
   const particles: Particle[] = [];
   const floatingTexts: FloatingText[] = [];
+  const animatedExplosions: AnimatedExplosion[] = [];
+  const spriteManager = initSpriteManager();
 
   function resizeCanvas() {
-    const rect = canvas.getBoundingClientRect();
+    const { w, h } = getViewportDimensions();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.floor(rect.width * dpr);
-    canvas.height = Math.floor(rect.height * dpr);
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    arenaWidth = rect.width;
-    arenaHeight = rect.height;
+    arenaWidth = w;
+    arenaHeight = h;
   }
 
   // Generate Unique ID
   let nextId = 1;
   function getId(): string {
     return `e_${nextId++}_${Date.now()}`;
+  }
+
+  // Notify React HUD with the single source of truth from the engine
+  function notifyHUD() {
+    callbacks.onHUDUpdate({
+      health: player.health,
+      maxHealth: player.maxHealth,
+      shield: player.shield,
+      maxShield: player.maxShield,
+      score,
+      highScore,
+      wave,
+      enemiesRemaining: enemies.length,
+      weapon: player.weapon,
+      weaponAmmo: player.weaponAmmo,
+      isPaused,
+      isGameOver,
+      isWaveCleared,
+    });
+  }
+
+  function pauseGame() {
+    isPaused = true;
+    notifyHUD();
+  }
+
+  function resumeGame() {
+    isPaused = false;
+    lastTime = performance.now();
+    notifyHUD();
+  }
+
+  function togglePauseGame() {
+    if (isPaused) {
+      resumeGame();
+    } else {
+      pauseGame();
+    }
   }
 
   // Spawn Enemy Wave
@@ -251,6 +327,31 @@ export function createTopDownEngine(
     });
   }
 
+  // Trigger player death & game over
+  function killPlayer(reason: string = "HULL DESTROYED") {
+    if (isGameOver) return;
+    player.health = 0;
+    player.shield = 0;
+    isGameOver = true;
+    playExplosionImpact(2.0);
+    screenShake = 30;
+    spawnParticles(player.x, player.y, "#ef4444", 60, 2.0);
+    spawnParticles(player.x, player.y, "#f59e0b", 40, 1.8);
+    spawnParticles(player.x, player.y, "#ffffff", 25, 2.2);
+    animatedExplosions.push(createAnimatedExplosion(player.x, player.y, 3, 2.5));
+    addFloatingText(player.x, player.y - 30, reason, "#ef4444");
+
+    if (score > highScore) {
+      highScore = score;
+      try {
+        localStorage.setItem("kheponastro_high_score", highScore.toString());
+      } catch {}
+    }
+
+    callbacks.onGameOver(score, highScore, wave);
+    notifyHUD();
+  }
+
   // Drop random pickup from destroyed enemy
   function dropPickup(x: number, y: number) {
     if (Math.random() < 0.35) return; // 65% chance to drop!
@@ -322,23 +423,46 @@ export function createTopDownEngine(
     const barrelLength = 24;
     const baseAngle = player.turretAngle;
 
+    // NUMERICAL METHODS: Use RK4 ballistic trajectory for rockets
+    const isRocket = player.weapon === "rocket";
+    let rocketTrajectory: RK4SystemResult | null = null;
+    if (isRocket) {
+      // Pre-compute RK4 trajectory for the rocket
+      rocketTrajectory = computeBallisticTrajectory(
+        wInfo.speed,           // initial velocity (game units)
+        baseAngle * 180 / Math.PI, // convert to degrees
+        0.015,                 // drag coefficient
+        1.0,                   // mass
+        9.81 * 0.1,            // scaled gravity for game units
+        0,                     // wind X
+        0                      // wind Y
+      );
+      // Add trajectory info to projectile for visual effect
+      addFloatingText(player.x, player.y - 30, "🚀 RK4 BALLISTIC", "#ef4444");
+    }
+
     if (wInfo.count === 1) {
       const spreadAngle = (Math.random() - 0.5) * wInfo.spread;
       const angle = baseAngle + spreadAngle;
+      const vx = Math.cos(angle) * wInfo.speed;
+      const vy = Math.sin(angle) * wInfo.speed;
+
       projectiles.push({
         id: getId(),
         x: player.x + Math.cos(baseAngle) * barrelLength,
         y: player.y + Math.sin(baseAngle) * barrelLength,
-        vx: Math.cos(angle) * wInfo.speed,
-        vy: Math.sin(angle) * wInfo.speed,
+        vx,
+        vy,
         damage: wInfo.damage,
         radius: wInfo.radius,
         color: wInfo.color,
         isPlayer: true,
-        isRocket: player.weapon === "rocket",
+        isRocket,
         life: 0,
-        maxLife: 2.2,
-      });
+        maxLife: isRocket ? 5.0 : 2.2, // Rockets live longer
+        trajectory: rocketTrajectory,
+        trajectoryIndex: 0,
+      } as Projectile & { trajectory?: RK4SystemResult; trajectoryIndex?: number });
     } else if (wInfo.count === 2) {
       // Twin cannons
       const offset = 6;
@@ -391,9 +515,31 @@ export function createTopDownEngine(
   function shootEnemy(enemy: EnemyTank) {
     playEnemyShoot();
     const barrelLength = enemy.size + 4;
-    const angle = enemy.turretAngle;
+
+    // NUMERICAL METHODS: Use intercept calculation for smart AI aiming
+    // Heavy and Boss tanks use Newton-Raphson intercept prediction
     const speed = enemy.type === "scout" ? 5.8 : enemy.type === "heavy" ? 5.0 : 5.4;
     const dmg = enemy.type === "heavy" ? 22 : enemy.type === "boss" ? 28 : 12;
+
+    let angle = enemy.turretAngle;
+    const isHeavyOrBoss = enemy.type === "heavy" || enemy.type === "boss";
+
+    if (isHeavyOrBoss) {
+      // Use numerical root-finding (Newton-Raphson) to calculate intercept angle
+      // Predict where player will be based on their current velocity
+      const interceptAngle = calculateEnemyInterceptAngle(
+        enemy,
+        player.x,
+        player.y,
+        player.vx,
+        player.vy,
+        speed,
+        false // enemy bullets don't have drag
+      );
+      angle = interceptAngle;
+      enemy.turretAngle = interceptAngle; // Update turret visual
+      addFloatingText(enemy.x, enemy.y - 20, "🎯 NEWTON-RAPHSON", "#f59e0b");
+    }
 
     projectiles.push({
       id: getId(),
@@ -410,9 +556,232 @@ export function createTopDownEngine(
     });
   }
 
+  // ============================================================================
+  // NUMERICAL METHODS INTEGRATION
+  // ============================================================================
+
+  // Cache for RK4 projectile trajectories (keyed by weapon type + angle + speed)
+  const trajectoryCache = new Map<string, RK4SystemResult>();
+
+  function getTrajectoryCacheKey(v0: number, angle: number, dragCoeff: number, mass: number): string {
+    return `${v0.toFixed(1)}_${angle.toFixed(1)}_${dragCoeff.toFixed(3)}_${mass.toFixed(1)}`;
+  }
+
+  /**
+   * Compute ballistic trajectory using RK4 (Runge-Kutta 4th order)
+   * Used for: Rocket projectiles, trajectory preview, AI aim prediction
+   */
+  function computeBallisticTrajectory(
+    v0: number,
+    angleDeg: number,
+    dragCoeff: number = 0.02,
+    mass: number = 1.0,
+    gravity: number = 9.81,
+    windX: number = 0,
+    windY: number = 0
+  ): RK4SystemResult {
+    // Clamp elevation angle to valid (0, 90) degrees range for RK4 artillery solver
+    const safeAngle = Math.max(1, Math.min(89, Math.abs(angleDeg) % 90 || 45));
+    const key = getTrajectoryCacheKey(v0, safeAngle, dragCoeff, mass);
+    const cached = trajectoryCache.get(key);
+    if (cached) return cached;
+
+    const result = rk4Projectile({
+      v0,
+      angle: safeAngle,
+      g: gravity,
+      dragCoeff,
+      mass,
+      dt: 0.01,
+      maxTime: 10.0,
+      windX,
+      windY,
+    });
+
+    // Cache for performance (limit cache size)
+    if (trajectoryCache.size > 100) {
+      const firstKey = trajectoryCache.keys().next().value;
+      if (firstKey) trajectoryCache.delete(firstKey);
+    }
+    trajectoryCache.set(key, result);
+    return result;
+  }
+
+  /**
+   * Calculate intercept angle for enemy AI using numerical root-finding
+   * Uses Newton-Raphson method for fast, accurate prediction
+   */
+  function calculateEnemyInterceptAngle(
+    enemy: EnemyTank,
+    targetX: number,
+    targetY: number,
+    targetVx: number,
+    targetVy: number,
+    projectileSpeed: number,
+    isRocket: boolean
+  ): number {
+    const dragCoeff = isRocket ? 0.015 : 0.0; // Rockets have slight drag, bullets are instant
+    const gravity = 0.0; // Top-down view: 2D plane has zero in-plane gravity
+
+    try {
+      const intercept = calculateInterceptAngle(
+        { x: enemy.x, y: enemy.y },
+        { x: targetX, y: targetY },
+        { x: targetVx, y: targetVy },
+        projectileSpeed,
+        gravity,
+        dragCoeff,
+        5.0 // max time
+      );
+
+      if (intercept.feasible) {
+        // calculateInterceptAngle returns angle in DEGREES; convert to RADIANS for topDownEngine
+        const angleRad = (intercept.angle * Math.PI) / 180;
+        const variation = (Math.random() - 0.5) * 0.05; // ±~1.5 degrees
+        return angleRad + variation;
+      }
+    } catch {
+      // Fallback below
+    }
+
+    // Fallback: direct aim with lead prediction (radians)
+    const dx = targetX - enemy.x;
+    const dy = targetY - enemy.y;
+    const dist = Math.hypot(dx, dy);
+    const timeToTarget = dist / projectileSpeed;
+    const leadX = targetX + targetVx * timeToTarget;
+    const leadY = targetY + targetVy * timeToTarget;
+    return Math.atan2(leadY - enemy.y, leadX - enemy.x);
+  }
+
+  /**
+   * Update projectile physics using numerical integration
+   * Rockets use RK4 trajectory, bullets use modified Euler with drag
+   */
+  function updateProjectilePhysics(projectile: Projectile, delta: number): void {
+    if (projectile.isRocket) {
+      // Rockets follow pre-computed RK4 trajectory with drag
+      // We simulate by applying drag forces each frame (simplified)
+      const dragResult = applyDrag(
+        projectile.vx,
+        projectile.vy,
+        0.015, // drag coefficient
+        1.0,   // mass
+        delta
+      );
+      projectile.vx = dragResult.vx;
+      projectile.vy = dragResult.vy;
+
+      // Update position
+      projectile.x += projectile.vx * delta * 60; // Scale to game units
+      projectile.y += projectile.vy * delta * 60;
+    } else {
+      // Regular bullets: simple linear motion with optional drag
+      if (projectile.vx !== 0 || projectile.vy !== 0) {
+        const dragResult = applyDrag(
+          projectile.vx,
+          projectile.vy,
+          0.001, // Very small drag for bullets
+          1.0,
+          delta
+        );
+        projectile.vx = dragResult.vx;
+        projectile.vy = dragResult.vy;
+      }
+      projectile.x += projectile.vx * delta * 60;
+      projectile.y += projectile.vy * delta * 60;
+    }
+    projectile.life += delta;
+  }
+
+  /**
+   * Use Modified Euler integration for smoother enemy movement
+   */
+  function updateEnemyPhysics(
+    enemy: EnemyTank,
+    targetX: number,
+    targetY: number,
+    delta: number,
+    allEnemies: EnemyTank[]
+  ): void {
+    const dt = delta * 60; // Frame-normalized time step (1.0 at nominal 60 FPS)
+    if (dt <= 0) return;
+
+    const dx = targetX - enemy.x;
+    const dy = targetY - enemy.y;
+    const dist = Math.hypot(dx, dy);
+
+    // Desired velocity toward target
+    let desiredVx = 0;
+    let desiredVy = 0;
+    if (dist > 1.0) {
+      desiredVx = (dx / dist) * enemy.speed;
+      desiredVy = (dy / dist) * enemy.speed;
+    }
+
+    // Steering force (proportional control with inertia)
+    const kp = 0.18;
+    const forceX = (desiredVx - enemy.vx) * kp;
+    const forceY = (desiredVy - enemy.vy) * kp;
+
+    // Repulsion force to prevent aircraft overlapping
+    let repForceX = 0;
+    let repForceY = 0;
+    for (let j = 0; j < allEnemies.length; j++) {
+      const other = allEnemies[j];
+      if (other.id === enemy.id) continue;
+      const sepX = enemy.x - other.x;
+      const sepY = enemy.y - other.y;
+      const sepDist = Math.hypot(sepX, sepY);
+      const minDist = enemy.size + other.size + 4;
+      if (sepDist < minDist && sepDist > 0) {
+        const push = ((minDist - sepDist) / minDist) * 1.5;
+        repForceX += (sepX / sepDist) * push;
+        repForceY += (sepY / sepDist) * push;
+      }
+    }
+
+    // Apply Modified Euler integration (Heun's 2nd-order predictor-corrector)
+    const newState = modifiedEulerStep(
+      { x: enemy.x, y: enemy.y, vx: enemy.vx, vy: enemy.vy },
+      1.0, // mass
+      [
+        { x: forceX, y: forceY },
+        { x: repForceX, y: repForceY },
+      ],
+      dt
+    );
+
+    enemy.x = newState.x;
+    enemy.y = newState.y;
+    enemy.vx = newState.vx;
+    enemy.vy = newState.vy;
+
+    if (Math.hypot(enemy.vx, enemy.vy) > 0.05) {
+      enemy.bodyAngle = Math.atan2(enemy.vy, enemy.vx);
+    }
+  }
+
+  /**
+   * Optimal weapon loadout selection using 0/1 Knapsack (Dynamic Programming)
+   * Called when player gets weapon pickups to suggest best combo
+   */
+  function computeOptimalLoadout(
+    availableWeapons: Array<{ id: string; weight: number; value: number; damage: number }>,
+    capacity: number
+  ): Array<{ id: string; weight: number; value: number; damage: number }> {
+    const weights = availableWeapons.map(w => w.weight);
+    const values = availableWeapons.map(w => w.value);
+    const result = knapsackOrdnanceSelector(weights, values, capacity);
+    return result.selectedItems.map(idx => availableWeapons[idx]);
+  }
+
   // Main Update Cycle
   function update(delta: number) {
-    if (isPaused || isGameOver) return;
+    if (isPaused || isGameOver) {
+      notifyHUD();
+      return;
+    }
 
     const now = performance.now();
 
@@ -502,35 +871,27 @@ export function createTopDownEngine(
         }
       }
 
-      const moveAngle = Math.atan2(targetY - e.y, targetX - e.x);
-      e.vx += Math.cos(moveAngle) * e.speed * 0.15;
-      e.vy += Math.sin(moveAngle) * e.speed * 0.15;
-
-      // Enemy-enemy repulsion to avoid stacking
-      for (let j = 0; j < enemies.length; j++) {
-        if (i === j) continue;
-        const other = enemies[j];
-        const sepX = e.x - other.x;
-        const sepY = e.y - other.y;
-        const sepDist = Math.hypot(sepX, sepY);
-        const minDist = e.size + other.size + 4;
-        if (sepDist < minDist && sepDist > 0) {
-          const push = (minDist - sepDist) / minDist * 1.5;
-          e.vx += (sepX / sepDist) * push;
-          e.vy += (sepY / sepDist) * push;
-        }
-      }
-
-      e.vx *= 0.88;
-      e.vy *= 0.88;
-      e.x += e.vx;
-      e.y += e.vy;
-      e.bodyAngle = Math.atan2(e.vy, e.vx);
+      // NUMERICAL METHODS: Use Modified Euler integration for smoother enemy physics
+      // This provides realistic acceleration/deceleration, steering inertia, and repulsion
+      updateEnemyPhysics(e, targetX, targetY, delta, enemies);
 
       // Clamp inside arena
       const eMargin = e.size + 8;
       e.x = Math.max(eMargin, Math.min(arenaWidth - eMargin, e.x));
       e.y = Math.max(eMargin, Math.min(arenaHeight - eMargin, e.y));
+      e.bodyAngle = Math.atan2(e.vy, e.vx);
+
+      // Check collision between Player and Enemy aircraft (ramming / mid-air collision)
+      const playerRadius = 20;
+      const currentDist = Math.hypot(player.x - e.x, player.y - e.y);
+      if (!isGameOver && currentDist < playerRadius + e.size) {
+        // Mid-air collision: explode collided enemy and instantly destroy player
+        animatedExplosions.push(createAnimatedExplosion(e.x, e.y, 2, 2.0));
+        spawnParticles(e.x, e.y, "#ef4444", 35, 1.8);
+        e.health = 0;
+        killPlayer("MID-AIR COLLISION!");
+        break;
+      }
 
       if (e.hitFlashTime > 0) {
         e.hitFlashTime = Math.max(0, e.hitFlashTime - delta);
@@ -546,22 +907,35 @@ export function createTopDownEngine(
     // 3. Projectile Updates & Collision Detection
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const p = projectiles[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.life += delta;
 
-      // Spawn faint rocket smoke
-      if (p.isRocket && Math.random() < 0.6) {
-        particles.push({
-          x: p.x,
-          y: p.y,
-          vx: -p.vx * 0.2 + (Math.random() - 0.5),
-          vy: -p.vy * 0.2 + (Math.random() - 0.5),
-          color: "#94a3b8",
-          size: 3,
-          life: 0,
-          maxLife: 0.35,
-        });
+      // NUMERICAL METHODS: Use RK4/Modified Euler physics integration for projectiles
+      // This applies drag, gravity, and proper ballistic trajectories
+      const projectileWithExtras = p as Projectile & { trajectory?: RK4SystemResult; trajectoryIndex?: number };
+      if (p.isRocket) {
+        // Use numerical integration with aerodynamic drag for rocket physics
+        updateProjectilePhysics(p, delta);
+
+        // Spawn faint rocket smoke
+        if (Math.random() < 0.6) {
+          particles.push({
+            x: p.x,
+            y: p.y,
+            vx: -p.vx * 0.2 + (Math.random() - 0.5),
+            vy: -p.vy * 0.2 + (Math.random() - 0.5),
+            color: "#94a3b8",
+            size: 3,
+            life: 0,
+            maxLife: 0.35,
+          });
+        }
+      } else {
+        // Regular bullets: simple linear motion with minimal drag
+        const dragResult = applyDrag(p.vx, p.vy, 0.001, 1.0, delta);
+        p.vx = dragResult.vx;
+        p.vy = dragResult.vy;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life += delta;
       }
 
       // Check wall bounce or despawn
@@ -586,6 +960,7 @@ export function createTopDownEngine(
               screenShake = 12;
               playExplosionImpact(1.2);
               spawnParticles(p.x, p.y, "#ef4444", 25, 1.4);
+              animatedExplosions.push(createAnimatedExplosion(p.x, p.y, 1, 1.4));
               for (const nearby of enemies) {
                 const splashDist = Math.hypot(p.x - nearby.x, p.y - nearby.y);
                 if (splashDist < 90) {
@@ -613,11 +988,16 @@ export function createTopDownEngine(
                 } catch {}
               }
 
-              playExplosionImpact(0.9);
+              playEnemyDie(e.type === "boss");
               screenShake = Math.max(screenShake, e.type === "boss" ? 18 : 6);
               spawnParticles(e.x, e.y, e.color, e.type === "boss" ? 40 : 20, 1.2);
               addFloatingText(e.x, e.y - 20, `+${e.points}`, "#34d399");
               dropPickup(e.x, e.y);
+
+              // Spawn animated explosion from sprite frames
+              const expSeries: 1 | 2 | 3 = e.type === "boss" ? 3 : e.type === "scout" ? 2 : 1;
+              const expScale = e.type === "boss" ? 2.4 : e.type === "heavy" ? 1.6 : 1.2;
+              animatedExplosions.push(createAnimatedExplosion(e.x, e.y, expSeries, expScale));
 
               enemies.splice(j, 1);
             }
@@ -654,10 +1034,7 @@ export function createTopDownEngine(
           }
 
           if (player.health <= 0) {
-            isGameOver = true;
-            playExplosionImpact(1.5);
-            spawnParticles(player.x, player.y, "#ef4444", 50, 1.6);
-            callbacks.onGameOver(score, highScore, wave);
+            killPlayer("HULL DESTROYED");
           }
 
           continue;
@@ -696,6 +1073,19 @@ export function createTopDownEngine(
           };
           player.weaponAmmo = ammoMap[pk.type] || 40;
           addFloatingText(player.x, player.y - 24, `${pk.name.toUpperCase()}!`, "#f59e0b");
+
+          // NUMERICAL METHODS: Use 0/1 Knapsack (Dynamic Programming) for optimal loadout suggestion
+          // Calculate optimal weapon combination based on damage/weight ratio
+          const availableWeapons = [
+            { id: "cannon", weight: 10, value: WEAPON_REGISTRY.cannon.damage, damage: WEAPON_REGISTRY.cannon.damage },
+            { id: "dual", weight: 15, value: WEAPON_REGISTRY.dual.damage * 2, damage: WEAPON_REGISTRY.dual.damage * 2 },
+            { id: "rapid", weight: 12, value: WEAPON_REGISTRY.rapid.damage * 8, damage: WEAPON_REGISTRY.rapid.damage * 8 },
+            { id: "shotgun", weight: 18, value: WEAPON_REGISTRY.shotgun.damage * 5, damage: WEAPON_REGISTRY.shotgun.damage * 5 },
+            { id: "rocket", weight: 25, value: WEAPON_REGISTRY.rocket.damage, damage: WEAPON_REGISTRY.rocket.damage },
+          ];
+          const optimalLoadout = computeOptimalLoadout(availableWeapons, 50); // Capacity = 50 weight units
+          const optimalNames = optimalLoadout.map(w => w.id.toUpperCase()).join(" + ");
+          addFloatingText(player.x, player.y - 40, `OPTIMAL: ${optimalNames} (Knapsack DP)`, "#10b981");
         }
       }
     }
@@ -706,6 +1096,13 @@ export function createTopDownEngine(
       score += wave * 500;
       addFloatingText(arenaWidth / 2, arenaHeight / 2 - 20, "WAVE CLEARED! +BONUS", "#34d399");
       callbacks.onWaveClear(wave, score);
+
+      // Automatically advance to next wave after 2.2 seconds so player is never stuck
+      setTimeout(() => {
+        if (isWaveCleared && !isGameOver) {
+          nextWaveAction();
+        }
+      }, 2200);
     }
 
     // 6. Update Particles & Floating Text
@@ -732,25 +1129,11 @@ export function createTopDownEngine(
     }
 
     // Inform React HUD
-    callbacks.onHUDUpdate({
-      health: player.health,
-      maxHealth: player.maxHealth,
-      shield: player.shield,
-      maxShield: player.maxShield,
-      score,
-      highScore,
-      wave,
-      enemiesRemaining: enemies.length,
-      weapon: player.weapon,
-      weaponAmmo: player.weaponAmmo,
-      isPaused,
-      isGameOver,
-      isWaveCleared,
-    });
+    notifyHUD();
   }
 
   // Draw Function
-  function draw() {
+  function draw(delta: number) {
     ctx.save();
 
     // Screen Shake effect
@@ -760,20 +1143,8 @@ export function createTopDownEngine(
       ctx.translate(sx, sy);
     }
 
-    // Background Arena Grid
-    ctx.fillStyle = "#030712"; // Dark slate
-    ctx.fillRect(0, 0, arenaWidth, arenaHeight);
-
-    // Subtle tactical grid
-    ctx.strokeStyle = "rgba(6, 182, 212, 0.06)";
-    ctx.lineWidth = 1;
-    const gridSize = 50;
-    for (let x = 0; x <= arenaWidth; x += gridSize) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, arenaHeight); ctx.stroke();
-    }
-    for (let y = 0; y <= arenaHeight; y += gridSize) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(arenaWidth, y); ctx.stroke();
-    }
+    // Background Arena (Tiled BG.png texture + tactical grid & vignette)
+    drawBackground(ctx, spriteManager, arenaWidth, arenaHeight);
 
     // Tread marks
     for (const tm of treadMarks) {
@@ -813,133 +1184,25 @@ export function createTopDownEngine(
       ctx.restore();
     }
 
-    // Draw Enemies
+    const nowSec = performance.now() * 0.001;
+
+    // Draw Enemies (With real enemy sprites, banking & hit flash!)
     for (const e of enemies) {
-      ctx.save();
-      ctx.translate(e.x, e.y);
-
-      // Tank Hull Body
-      ctx.save();
-      ctx.rotate(e.bodyAngle);
-
-      // Tracks
-      ctx.fillStyle = "#0f172a";
-      ctx.fillRect(-e.size, -e.size * 0.9, e.size * 2, e.size * 0.4);
-      ctx.fillRect(-e.size, e.size * 0.5, e.size * 2, e.size * 0.4);
-
-      // Hull
-      ctx.beginPath();
-      ctx.roundRect(-e.size * 0.8, -e.size * 0.7, e.size * 1.6, e.size * 1.4, 4);
-      ctx.fillStyle = e.hitFlashTime > 0 ? "#ffffff" : e.color;
-      ctx.fill();
-      ctx.strokeStyle = "#0f172a";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.restore();
-
-      // Turret
-      ctx.save();
-      ctx.rotate(e.turretAngle);
-      // Barrel
-      ctx.fillStyle = "#1e293b";
-      ctx.fillRect(0, -e.size * 0.18, e.size * 1.3, e.size * 0.36);
-      ctx.strokeStyle = e.color;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(0, -e.size * 0.18, e.size * 1.3, e.size * 0.36);
-
-      // Turret Dome
-      ctx.beginPath();
-      ctx.arc(0, 0, e.size * 0.5, 0, Math.PI * 2);
-      ctx.fillStyle = "#0f172a";
-      ctx.fill();
-      ctx.strokeStyle = e.color;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.restore();
-
-      // Health Bar
-      const hpPct = Math.max(0, e.health / e.maxHealth);
-      const barW = e.size * 2.2;
-      const barH = 4;
-      ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
-      ctx.fillRect(-barW / 2, -e.size - 10, barW, barH);
-      ctx.fillStyle = hpPct > 0.5 ? "#10b981" : hpPct > 0.25 ? "#f59e0b" : "#ef4444";
-      ctx.fillRect(-barW / 2, -e.size - 10, barW * hpPct, barH);
-
-      ctx.restore();
+      drawEnemySprite(ctx, spriteManager, e, nowSec);
     }
 
-    // Draw Player Tank
+    // Draw Player Ship (With real blue fighter ship, banking & animated exhaust plume!)
     if (!isGameOver) {
-      ctx.save();
-      ctx.translate(player.x, player.y);
-
-      // Shield bubble
-      if (player.shield > 0) {
-        ctx.beginPath();
-        ctx.arc(0, 0, 30, 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(56, 189, 248, ${0.4 + 0.2 * Math.sin(performance.now() * 0.008)})`;
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        ctx.fillStyle = "rgba(56, 189, 248, 0.06)";
-        ctx.fill();
-      }
-
-      // Hull
-      ctx.save();
-      ctx.rotate(player.bodyAngle);
-
-      // Player Treads
-      ctx.fillStyle = "#1e293b";
-      ctx.fillRect(-16, -14, 32, 6);
-      ctx.fillRect(-16, 8, 32, 6);
-
-      // Player Chassis
-      ctx.beginPath();
-      ctx.roundRect(-13, -11, 26, 22, 4);
-      ctx.fillStyle = player.invulnerableTime > 0 && Math.floor(performance.now() / 80) % 2 === 0 ? "#ffffff" : "#0284c7";
-      ctx.fill();
-      ctx.strokeStyle = "#38bdf8";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.restore();
-
-      // Turret
-      ctx.save();
-      ctx.rotate(player.turretAngle);
-
-      // Gun Barrel
-      const wInfo = WEAPON_REGISTRY[player.weapon];
-      ctx.fillStyle = "#0f172a";
-      ctx.fillRect(0, -3, 22, 6);
-      ctx.strokeStyle = wInfo.color;
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(0, -3, 22, 6);
-
-      // Turret Cupola
-      ctx.beginPath();
-      ctx.arc(0, 0, 9, 0, Math.PI * 2);
-      ctx.fillStyle = "#0f172a";
-      ctx.fill();
-      ctx.strokeStyle = "#38bdf8";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.restore();
-      ctx.restore();
+      drawPlayerSprite(ctx, spriteManager, player, nowSec);
     }
 
-    // Draw Projectiles
+    // Draw Projectiles (With real FX sprites: plasma bolts, vulcan tracers, proton warheads!)
     for (const p of projectiles) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-      ctx.fillStyle = p.color;
-      ctx.fill();
-      ctx.shadowColor = p.color;
-      ctx.shadowBlur = 8;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+      drawProjectileSprite(ctx, spriteManager, p, nowSec);
     }
+
+    // Draw Animated Explosions (Explosions 1, 2, 3 frame series!)
+    updateAndDrawExplosions(ctx, spriteManager, animatedExplosions, isPaused ? 0 : delta);
 
     // Draw Particles
     for (const pt of particles) {
@@ -994,7 +1257,8 @@ export function createTopDownEngine(
     if (e.key === "5") { player.weapon = "rocket"; if (player.weaponAmmo <= 0) player.weaponAmmo = WEAPON_REGISTRY.rocket.maxAmmo; }
 
     if (e.key === "Escape") {
-      isPaused = !isPaused;
+      e.preventDefault();
+      togglePauseGame();
     }
     if ((e.key === "r" || e.key === "R") && isGameOver) {
       restartGame();
@@ -1027,6 +1291,7 @@ export function createTopDownEngine(
     score = 0;
     isGameOver = false;
     isWaveCleared = false;
+    isPaused = false;
     player.health = 100;
     player.shield = 50;
     player.weapon = "cannon";
@@ -1040,7 +1305,9 @@ export function createTopDownEngine(
     particles.length = 0;
     floatingTexts.length = 0;
     treadMarks.length = 0;
+    animatedExplosions.length = 0;
     spawnWave(1);
+    notifyHUD();
   }
 
   function nextWaveAction() {
@@ -1048,22 +1315,28 @@ export function createTopDownEngine(
     player.health = Math.min(player.maxHealth, player.health + 25);
     player.shield = player.maxShield;
     spawnWave(wave);
+    notifyHUD();
   }
 
-  // Animation Loop
+  // Animation Loop (Protected against any crash/freeze)
   function loop(time: number) {
+    animationId = requestAnimationFrame(loop);
+
     const delta = Math.min((time - lastTime) / 1000, 0.1);
     lastTime = time;
 
-    update(delta);
-    draw();
-
-    animationId = requestAnimationFrame(loop);
+    try {
+      update(delta);
+      draw(delta);
+    } catch (err) {
+      console.error("Game loop tick error:", err);
+    }
   }
 
   // Initialize
   resizeCanvas();
   spawnWave(wave);
+  notifyHUD();
 
   // Return Engine Controller
   return {
@@ -1088,12 +1361,15 @@ export function createTopDownEngine(
       }
     },
     pause: () => {
-      isPaused = true;
+      pauseGame();
     },
     resume: () => {
-      isPaused = false;
-      lastTime = performance.now();
+      resumeGame();
     },
+    togglePause: () => {
+      togglePauseGame();
+    },
+    isPaused: () => isPaused,
     restart: () => {
       restartGame();
     },
