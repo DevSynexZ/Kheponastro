@@ -80,10 +80,9 @@ export default function GameArena() {
       if (e.key === "4") engineRef.current?.selectWeapon("shotgun");
       if (e.key === "5") engineRef.current?.selectWeapon("rocket");
 
-      // Pause toggle
+      // Pause toggle (handled directly by engine to avoid double-toggle)
       if (e.key === "Escape") {
-        if (hud.isPaused) engineRef.current?.resume();
-        else engineRef.current?.pause();
+        e.preventDefault();
       }
 
       // Next wave or Restart
@@ -158,8 +157,7 @@ export default function GameArena() {
         hud={hud}
         onWeaponSelect={(w: WeaponType) => engineRef.current?.selectWeapon(w)}
         onPauseToggle={() => {
-          if (hud.isPaused) engineRef.current?.resume();
-          else engineRef.current?.pause();
+          engineRef.current?.togglePause();
         }}
         onNextWave={() => engineRef.current?.nextWave()}
         onRestart={() => engineRef.current?.restart()}

@@ -288,6 +288,104 @@ export function playWarningAlarm(duration: number = 2.0): void {
   }
 }
 
+// Sound buffers cache for game sound files
+const soundBuffers: Record<string, AudioBuffer | null> = {
+  "fire-1": null,
+  "fire-2": null,
+  "fire-3": null,
+  "fire-4": null,
+  "fire-5": null,
+  "enemy-die": null,
+};
+let isPreloading = false;
+let audioBuffersLoaded = false;
+
+/**
+ * Preload MP3 audio files into Web Audio PCM buffers for 0ms latency playback
+ */
+export async function preloadGameSounds(): Promise<void> {
+  if (typeof window === "undefined" || audioBuffersLoaded || isPreloading) return;
+  isPreloading = true;
+
+  const ctx = getAudioContext();
+  if (!ctx) {
+    isPreloading = false;
+    return;
+  }
+
+  const soundUrls: Record<string, string> = {
+    "fire-1": "/sounds/fire-1.mp3",
+    "fire-2": "/sounds/fire-2.mp3",
+    "fire-3": "/sounds/fire-3.mp3",
+    "fire-4": "/sounds/fire-4.mp3",
+    "fire-5": "/sounds/fire-5.mp3",
+    "enemy-die": "/sounds/enemy-die.mp3",
+  };
+
+  await Promise.all(
+    Object.entries(soundUrls).map(async ([key, url]) => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) return;
+        const arrayBuffer = await response.arrayBuffer();
+        const decoded = await ctx.decodeAudioData(arrayBuffer);
+        soundBuffers[key] = decoded;
+      } catch (err) {
+        // Fallback to HTMLAudioElement if decode fails
+      }
+    })
+  );
+
+  audioBuffersLoaded = true;
+  isPreloading = false;
+}
+
+/**
+ * Helper to play a pre-buffered or HTMLAudio sound
+ */
+function playBufferSound(
+  key: string,
+  volume: number = 0.5,
+  pitchVariance: number = 0.04
+): boolean {
+  if (audioMuted) return true;
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return false;
+
+    // Trigger preloading in the background if not yet loaded
+    if (!audioBuffersLoaded && !isPreloading) {
+      preloadGameSounds().catch(() => {});
+    }
+
+    const buffer = soundBuffers[key];
+    if (buffer) {
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+
+      if (pitchVariance > 0) {
+        source.playbackRate.value = 1.0 + (Math.random() - 0.5) * pitchVariance * 2;
+      }
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(Math.max(0, Math.min(1, volume)), ctx.currentTime);
+
+      source.connect(gain);
+      gain.connect(ctx.destination);
+      source.start(0);
+      return true;
+    }
+
+    // HTMLAudioElement fallback while buffer is fetching
+    const fallback = new Audio(`/sounds/${key}.mp3`);
+    fallback.volume = Math.max(0, Math.min(1, volume));
+    fallback.play().catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Cannon Firing Sound
  */
@@ -295,53 +393,58 @@ export function playCannonFire(): void {
   playPlayerShoot("cannon");
 }
 
+/**
+ * Player Shoot Sound - 5 distinct fire sounds mapped to the 5 weapon types:
+ * 1. Cannon  -> fire-1.mp3
+ * 2. Dual    -> fire-2.mp3
+ * 3. Rapid   -> fire-3.mp3
+ * 4. Shotgun -> fire-4.mp3
+ * 5. Rocket  -> fire-5.mp3
+ */
 export function playPlayerShoot(weapon: string = "cannon"): void {
   try {
-    const ctx = getAudioContext();
-    if (!ctx) return;
-    const now = ctx.currentTime;
+    let key = "fire-1";
+    let vol = 0.5;
 
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    if (weapon === "rapid") {
-      osc.type = "sawtooth";
-      osc.frequency.setValueAtTime(280, now);
-      osc.frequency.exponentialRampToValueAtTime(80, now + 0.08);
-      gain.gain.setValueAtTime(0.25, now);
-      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.08);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.09);
-    } else if (weapon === "shotgun") {
-      osc.type = "square";
-      osc.frequency.setValueAtTime(180, now);
-      osc.frequency.exponentialRampToValueAtTime(30, now + 0.2);
-      gain.gain.setValueAtTime(0.4, now);
-      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.22);
-    } else if (weapon === "rocket") {
-      osc.type = "sawtooth";
-      osc.frequency.setValueAtTime(120, now);
-      osc.frequency.exponentialRampToValueAtTime(40, now + 0.35);
-      gain.gain.setValueAtTime(0.45, now);
-      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.38);
-    } else {
-      // standard cannon / dual
-      osc.type = "sawtooth";
-      osc.frequency.setValueAtTime(200, now);
-      osc.frequency.exponentialRampToValueAtTime(45, now + 0.18);
-      gain.gain.setValueAtTime(0.35, now);
-      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.2);
+    switch (weapon) {
+      case "cannon":
+        key = "fire-1";
+        vol = 0.52;
+        break;
+      case "dual":
+        key = "fire-2";
+        vol = 0.5;
+        break;
+      case "rapid":
+        key = "fire-3";
+        vol = 0.42;
+        break;
+      case "shotgun":
+        key = "fire-4";
+        vol = 0.6;
+        break;
+      case "rocket":
+        key = "fire-5";
+        vol = 0.7;
+        break;
+      default:
+        key = "fire-1";
+        vol = 0.5;
+        break;
     }
+
+    playBufferSound(key, vol, 0.04);
+  } catch {
+    // Ignore audio failures
+  }
+}
+
+/**
+ * Enemy Die Sound - Uses enemy-die from sounds folder
+ */
+export function playEnemyDie(isBoss: boolean = false): void {
+  try {
+    playBufferSound("enemy-die", isBoss ? 0.85 : 0.6, isBoss ? 0.02 : 0.06);
   } catch {
     // Ignore audio failures
   }
@@ -423,7 +526,10 @@ export function playPickupSound(): void {
  * Initialize audio context on first user interaction (required by browsers)
  */
 export function initAudio(): void {
-  getAudioContext();
+  const ctx = getAudioContext();
+  if (ctx && !audioBuffersLoaded) {
+    preloadGameSounds().catch(() => {});
+  }
 }
 
 /**
