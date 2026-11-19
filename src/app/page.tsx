@@ -103,7 +103,7 @@ export default function KheponastroHome() {
     <div className="flex-1 flex flex-col justify-center">
       {!inMenu ? (
         <HomeComponent 
-          onEnterArena={handleEnterArena} 
+          onEnterArena={handleLoadingComplete} 
           trajectoryLoading={trajectoryLoading}
           trajectoryData={trajectoryData}
         />

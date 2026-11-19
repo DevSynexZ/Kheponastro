@@ -270,7 +270,7 @@ export default function GameHUD({
       </AnimatePresence>
 
       {/* Paused Overlay */}
-      <AnimatePresence>
+      {/* <AnimatePresence>
         {hud.isPaused && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -306,7 +306,7 @@ export default function GameHUD({
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
+      </AnimatePresence> */}
     </>
   );
 }

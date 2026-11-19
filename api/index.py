@@ -1,79 +1,12 @@
-import sys
-import os
-
-# Ensure the root/parent directory is in sys.path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-import math
+from pydantic import BaseModel
+from api.solvers.engine import rk4_projectile, newton_raphson_method
 
-from api.solvers.engine import (
-    bisection_method, false_position_method, newton_raphson_method,
-    gauss_elimination, gauss_jordan, euler_method, modified_euler_method,
-    rk4_projectile, knapsack_ordnance_selector
-)
+# 1. Instantiate FastAPI FIRST before declaring any routes
+app = FastAPI(title="Kheponastro Numerical Engine", version="2.0.0")
 
-# Pre-defined safe functions for root-finding API
-SAFE_FUNCTIONS = {
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "exp": math.exp,
-    "log": math.log,
-    "sqrt": math.sqrt,
-    "abs": abs,
-    "pi": math.pi,
-    "e": math.e,
-}
-
-def _make_func(expr: str) -> callable:
-    """Safely create a function from a mathematical expression string."""
-    # Validate expression only contains safe characters
-    allowed_chars = set("0123456789.+-*/()x ")
-    allowed_names = set(SAFE_FUNCTIONS.keys())
-
-    # Check for disallowed names
-    import re
-    names = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', expr)
-    for name in names:
-        if name not in allowed_names and name != 'x':
-            raise ValueError(f"Disallowed function/name: {name}")
-
-    code = compile(expr, "<string>", "eval")
-    # Verify no dangerous bytecode
-    for const in code.co_names:
-        if const not in allowed_names and const != 'x':
-            raise ValueError(f"Disallowed name in expression: {const}")
-
-    def f(x: float) -> float:
-        return eval(code, {"__builtins__": {}}, {**SAFE_FUNCTIONS, "x": x})
-
-    return f
-
-
-def _make_func_2d(expr: str) -> callable:
-    """Safely create a 2D function f(x, y) from expression."""
-    allowed_names = set(SAFE_FUNCTIONS.keys()) | {'x', 'y'}
-
-    import re
-    names = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', expr)
-    for name in names:
-        if name not in allowed_names:
-            raise ValueError(f"Disallowed function/name: {name}")
-
-    code = compile(expr, "<string>", "eval")
-
-    def f(x: float, y: float) -> float:
-        return eval(code, {"__builtins__": {}}, {**SAFE_FUNCTIONS, "x": x, "y": y})
-
-    return f
-
-
-app = FastAPI(title="Ballistix Numerical Engine", docs_url="/api/py/docs")
-
+# Enable CORS so Next.js frontend can communicate with FastAPI
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -82,212 +15,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# 2. Health check endpoint
 @app.get("/api/py/health")
 def health_check():
     return {
         "status": "ONLINE",
         "engine": "Python FastAPI + NumPy",
-        "version": "2.0.0",
-        "solvers_ready": [
-            "Bisection", "False Position", "Newton-Raphson",
-            "Gauss Elimination", "Gauss-Jordan", "Euler",
-            "Modified Euler", "RK4 Projectile", "0/1 Knapsack"
-        ]
+        "version": "2.0.0"
     }
 
+# 3. Player Firing Request Model & Endpoint (RK4 Physics + Wind)
+class PlayerFireRequest(BaseModel):
+    v0: float
+    angle: float
+    ammo_type: str
+    drag_coeff: float = 0.02
+    mass: float = 1.0
+    wind_speed: float = 0.0
 
-# =============================================================================
-# ROOT-FINDING ENDPOINTS
-# =============================================================================
+@app.post("/api/py/player-fire")
+def player_fire(req: PlayerFireRequest):
+    result = rk4_projectile(
+        v0=req.v0,
+        angle=req.angle,
+        drag_coeff=req.drag_coeff,
+        mass=req.mass,
+        wind_speed=req.wind_speed,
+        dt=0.01
+    )
+    return {
+        "ammo_type": req.ammo_type,
+        "trajectory": result.get("trajectory", []),
+        "range": result.get("range", 0.0)
+    }
 
-class BisectionRequest(BaseModel):
-    function: str = Field(..., description="Expression in x, e.g. 'x**2 - 4' or 'sin(x) - 0.5'")
-    xl: float = Field(..., description="Lower bound")
-    xu: float = Field(..., description="Upper bound")
-    tol: float = Field(1e-6, gt=0, description="Tolerance")
-    max_iter: int = Field(100, gt=0, le=10000, description="Max iterations")
+# 4. Enemy Counter-Fire Request Model & Endpoint (Newton-Raphson Solver)
+class EnemyAIAimRequest(BaseModel):
+    target_x: float
+    target_y: float
+    enemy_x: float
+    enemy_y: float
+    wind_speed: float = 0.0
 
+@app.post("/api/py/enemy-ai-aim")
+def enemy_ai_aim(req: EnemyAIAimRequest):
+    distance_to_player = abs(req.target_x - req.enemy_x)
+    
+    # Newton-Raphson optimization to find firing angle θ that bridges distance
+    def f(theta):
+        res = rk4_projectile(v0=175.0, angle=theta, drag_coeff=0.04, mass=2.8, wind_speed=req.wind_speed)
+        return res.get("range", 0.0) - distance_to_player
 
-@app.post("/api/py/root/bisection")
-def root_bisection(req: BisectionRequest):
+    def df(theta):
+        h = 1e-4
+        res1 = rk4_projectile(v0=175.0, angle=theta + h, drag_coeff=0.04, mass=2.8, wind_speed=req.wind_speed)
+        res2 = rk4_projectile(v0=175.0, angle=theta - h, drag_coeff=0.04, mass=2.8, wind_speed=req.wind_speed)
+        return (res1.get("range", 0.0) - res2.get("range", 0.0)) / (2 * h)
+
     try:
-        f = _make_func(req.function)
-        result = bisection_method(f, req.xl, req.xu, req.tol, req.max_iter)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        solution = newton_raphson_method(f, df, x0=55.0, tol=1e-4)
+        firing_angle = solution.get("root", 55.0)
+    except Exception:
+        firing_angle = 55.0
 
-
-class FalsePositionRequest(BaseModel):
-    function: str = Field(..., description="Expression in x")
-    xl: float = Field(..., description="Lower bound")
-    xu: float = Field(..., description="Upper bound")
-    tol: float = Field(1e-6, gt=0)
-    max_iter: int = Field(100, gt=0, le=10000)
-
-
-@app.post("/api/py/root/false-position")
-def root_false_position(req: FalsePositionRequest):
-    try:
-        f = _make_func(req.function)
-        result = false_position_method(f, req.xl, req.xu, req.tol, req.max_iter)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-class NewtonRaphsonRequest(BaseModel):
-    function: str = Field(..., description="Expression in x, e.g. 'x**2 - 4'")
-    derivative: str = Field(..., description="Derivative expression in x, e.g. '2*x'")
-    x0: float = Field(..., description="Initial guess")
-    tol: float = Field(1e-6, gt=0)
-    max_iter: int = Field(100, gt=0, le=10000)
-
-
-@app.post("/api/py/root/newton-raphson")
-def root_newton_raphson(req: NewtonRaphsonRequest):
-    try:
-        f = _make_func(req.function)
-        df = _make_func(req.derivative)
-        result = newton_raphson_method(f, df, req.x0, req.tol, req.max_iter)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# =============================================================================
-# LINEAR ALGEBRA ENDPOINTS
-# =============================================================================
-
-class LinearSystemRequest(BaseModel):
-    A: List[List[float]] = Field(..., description="Coefficient matrix (n x n)")
-    b: List[float] = Field(..., description="Right-hand side vector (n)")
-
-
-@app.post("/api/py/linear/gauss-elimination")
-def linear_gauss_elimination(req: LinearSystemRequest):
-    try:
-        result = gauss_elimination(req.A, req.b)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/py/linear/gauss-jordan")
-def linear_gauss_jordan(req: LinearSystemRequest):
-    try:
-        result = gauss_jordan(req.A, req.b)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# =============================================================================
-# ODE ENDPOINTS
-# =============================================================================
-
-class ODERequest(BaseModel):
-    function: str = Field(..., description="Expression in x and y, e.g. 'x + y' or '-y'")
-    x0: float = Field(..., description="Initial x")
-    y0: float = Field(..., description="Initial y")
-    x_target: float = Field(..., description="Target x value")
-    h: float = Field(..., gt=0, description="Step size")
-
-
-@app.post("/api/py/ode/euler")
-def ode_euler(req: ODERequest):
-    try:
-        f = _make_func_2d(req.function)
-        result = euler_method(f, req.x0, req.y0, req.x_target, req.h)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/py/ode/modified-euler")
-def ode_modified_euler(req: ODERequest):
-    try:
-        f = _make_func_2d(req.function)
-        result = modified_euler_method(f, req.x0, req.y0, req.x_target, req.h)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# =============================================================================
-# BALLISTICS ENDPOINTS
-# =============================================================================
-
-class KnapsackRequest(BaseModel):
-    capacity: float = Field(..., gt=0, description="Maximum capacity")
-    items: List[Dict[str, Any]] = Field(..., description="List of items with 'weight' and 'value'")
-
-
-@app.post("/api/py/optimize-ordnance")
-def optimize_ordnance(req: KnapsackRequest):
-    try:
-        weights = [float(item.get("weight", 0)) for item in req.items]
-        values = [float(item.get("value", 0)) for item in req.items]
-
-        if len(weights) != len(values):
-            raise ValueError("Each item must have both weight and value")
-
-        result = knapsack_ordnance_selector(weights, values, req.capacity)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-class SimulationRequest(BaseModel):
-    v0: float = Field(..., gt=0, description="Initial velocity (m/s)")
-    angle: float = Field(..., gt=0, lt=90, description="Launch angle (degrees)")
-    drag_coeff: float = Field(0.02, ge=0, description="Drag coefficient (kg/m)")
-    mass: float = Field(1.0, gt=0, description="Projectile mass (kg)")
-    dt: float = Field(0.01, gt=0, le=1, description="Time step (s)")
-
-
-@app.post("/api/py/simulate-trajectory")
-def simulate_trajectory(req: SimulationRequest):
-    try:
-        result = rk4_projectile(
-            v0=req.v0,
-            angle=req.angle,
-            drag_coeff=req.drag_coeff,
-            mass=req.mass,
-            dt=req.dt
-        )
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# =============================================================================
-# BATCH ENDPOINTS
-# =============================================================================
-
-class BatchBisectionRequest(BaseModel):
-    function: str = Field(..., description="Expression in x")
-    xl: List[float] = Field(..., description="Array of lower bounds")
-    xu: List[float] = Field(..., description="Array of upper bounds")
-    tol: float = Field(1e-6, gt=0)
-    max_iter: int = Field(100, gt=0, le=10000)
-
-
-@app.post("/api/py/root/batch-bisection")
-def root_batch_bisection(req: BatchBisectionRequest):
-    try:
-        import numpy as np
-        from api.solvers.engine import batch_bisection
-
-        f = _make_func(req.function)
-        # Vectorize the function
-        f_vec = np.vectorize(f)
-
-        xl_arr = np.array(req.xl, dtype=np.float64)
-        xu_arr = np.array(req.xu, dtype=np.float64)
-
-        roots = batch_bisection(f_vec, xl_arr, xu_arr, req.tol, req.max_iter)
-        return {"roots": roots.tolist()}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # Compute trajectory with solved angle
+    traj_result = rk4_projectile(v0=175.0, angle=firing_angle, drag_coeff=0.04, mass=2.8, wind_speed=req.wind_speed)
+    
+    return {
+        "angle": round(firing_angle, 2),
+        "trajectory": traj_result.get("trajectory", [])
+    }
